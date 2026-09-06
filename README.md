@@ -22,6 +22,6 @@ This repository contains a collection of  MATLAB scripts designed for Frequency 
 
 ## Requirements
 
-- **MATLAB** (R2021a or newer recommended)
+- **MATLAB** 
 - **Phased Array System Toolbox** (Required for `phased.FMCWWaveform` and `delayseq`)
 - **Parallel Computing Toolbox**  (Required for `parfor`)
