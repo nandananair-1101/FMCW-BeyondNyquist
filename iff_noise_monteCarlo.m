@@ -17,11 +17,11 @@ N_chirps = 64;
 R_nyquist = (c * Fs/2) / (2 * S);
 fprintf('System Nyquist Unambiguous Range: %.1f m\n', R_nyquist);
 %% 2. MULTI-TARGET & MONTE CARLO CONFIG
-target_Rs = [65.0, 130.0, 240.0, 377.0, 422.0];        
+target_Rs = [510.0, 550.0, 570.0, 600.0, 610.0];        
 target_vs = [-5.0, -10.0, -15.0, 5.0, 15.0];        
 num_targets = length(target_Rs);
-snr_vec = -50:5:20;          
-num_monte_carlo = 5;         
+snr_vec = -50:5:40;          
+num_monte_carlo = 60;         
 rmse_pure_fft_range_agg = zeros(length(snr_vec), 1);
 rmse_iff_range_agg      = zeros(length(snr_vec), 1);
 rmse_pure_fft_vel_agg   = zeros(length(snr_vec), 1);
@@ -192,7 +192,7 @@ for snr_idx = 1:length(snr_vec)
         detected_ranges = zeros(1, num_targets);
         detected_vels   = zeros(1, num_targets); 
         
-        % --- DATA-DRIVEN BLIND SNR & SIGMA ESTIMATION ---
+        
         noise_floor_est = median(abs(RDM_pure(:))) / 0.6745; 
         peak_signal_val = max(RDM_pure(:));
         est_linear_snr = max(1, (peak_signal_val / noise_floor_est)^2);
@@ -225,7 +225,7 @@ for snr_idx = 1:length(snr_vec)
             t_abs = t_total(1:end-1);
             a_t = S * mod(t_abs, Tc);  
             
-            % Fine Range Optimization using fminbnd (Sub-millimeter precision)
+            
             options = optimset('TolX', 1e-8, 'Display', 'off');
             fd_fixed = 2 * rough_v_center / lambda; 
             
