@@ -2,8 +2,7 @@ clear;
 clc;
 close all;
 tic;
-fprintf('Starting Fast Monte Carlo Simulation with Aggregate Target Averaging (Parallelized)...\n');
-
+fprintf('Starting Fast Monte Carlo Simulation with Blind Data-Driven Sigma Scaling (Parallelized)...\n');
 %% 1. SYSTEM PARAMETERS 
 c = 3e8;
 fc = 77e9;
@@ -17,29 +16,20 @@ S = B/Tc;
 N_chirps = 64; 
 R_nyquist = (c * Fs/2) / (2 * S);
 fprintf('System Nyquist Unambiguous Range: %.1f m\n', R_nyquist);
-
 %% 2. MULTI-TARGET & MONTE CARLO CONFIG
-target_Rs = [480.0, 490.0, 510.0, 555.0, 620.0];        
-target_vs = [-10.0, -20.0, -15.0, -35.0, -25.0];        
+target_Rs = [65.0, 130.0, 240.0, 377.0, 422.0];        
+target_vs = [-5.0, -10.0, -15.0, 5.0, 15.0];        
 num_targets = length(target_Rs);
-
-snr_vec = -5:5:30;          
+snr_vec = -50:5:20;          
 num_monte_carlo = 5;         
-
-
 rmse_pure_fft_range_agg = zeros(length(snr_vec), 1);
 rmse_iff_range_agg      = zeros(length(snr_vec), 1);
 rmse_pure_fft_vel_agg   = zeros(length(snr_vec), 1);
 rmse_iff_vel_agg        = zeros(length(snr_vec), 1);
-
-
-global_err_fft_r = [];
-global_err_iff_r = [];
-
-
+cdf_err_fft_r_10db = [];
+cdf_err_iff_r_10db = [];
 total_time_fft = 0;
 total_time_iff = 0;
-
 %% 3. SIGNAL GENERATION 
 tau_true = 2 * target_Rs / c;     
 single_waveform = phased.FMCWWaveform( ...
@@ -51,7 +41,6 @@ single_waveform = phased.FMCWWaveform( ...
 tx_single = single_waveform();
 tx = repmat(tx_single, N_chirps, 1);
 rx_clean = zeros(size(tx));
-
 for m = 1:N_chirps
     t_slow = (m - 1) * Tc;
     rx_chirp_m = zeros(size(tx_single));
@@ -62,28 +51,21 @@ for m = 1:N_chirps
     end
     rx_clean((m-1)*N_samples + 1 : m*N_samples) = rx_chirp_m;
 end
-
 %% 4. PRE-CALCULATE AXES & CONSTANTS
 n_fft_range = 4096;
 n_fft_doppler = 128;
 max_search_range = 1000.0;
 max_k = floor(max_search_range / R_nyquist); 
-
 range_win = hann(N_samples);
 doppler_win = hann(N_chirps)';
-
 fft_freq_axis = (0 : n_fft_range-1)' * (Fs / n_fft_range);
 fft_range_axis = fft_freq_axis * c / (2 * S);
-
 PRF = 1 / Tc;
 doppler_freqs = (-n_fft_doppler/2 : n_fft_doppler/2 - 1) * (PRF / n_fft_doppler);
 rdm_velocity_axis = doppler_freqs * (lambda / 2);
-
 rough_velocity_axis = linspace(-50, 50, 21); 
-
 N_total = length(tx);
 t_total = (0:N_total-1)' / Fs;
-
 %% 5. MONTE CARLO OVER SNR 
 for snr_idx = 1:length(snr_vec)
     current_snr = snr_vec(snr_idx);
@@ -121,10 +103,9 @@ for snr_idx = 1:length(snr_vec)
             [~, max_lin_idx] = max(temp_RDM(:));
             [r_bin, c_bin] = ind2sub(size(temp_RDM), max_lin_idx);
             raw_fft_ranges(i) = fft_range_axis(r_bin); 
-            raw_fft_vels(i)   = rdm_velocity_axis(c_bin);
+            raw_fft_vels(i)   = -rdm_velocity_axis(c_bin);
             temp_RDM(max(1, r_bin-5):min(n_fft_range, r_bin+5), :) = 0;
         end
-        
         
         pure_fft_detected_ranges = zeros(1, num_targets);
         pure_fft_detected_vels   = zeros(1, num_targets);
@@ -140,7 +121,7 @@ for snr_idx = 1:length(snr_vec)
         
         time_fft_mc(mc) = toc(t1);
         
-        %%  METHOD 2: FFT + IFF 
+        %% --- METHOD 2: FFT + IFF ---
         t2 = tic;
         
         rough_detected_ranges = zeros(1, num_targets);
@@ -208,10 +189,15 @@ for snr_idx = 1:length(snr_vec)
         [rough_detected_ranges, sort_idx] = sort(rough_detected_ranges);
         rough_detected_velocities = rough_detected_velocities(sort_idx);
         
-        
         detected_ranges = zeros(1, num_targets);
         detected_vels   = zeros(1, num_targets); 
-        sigma = 0.005;
+        
+        % --- DATA-DRIVEN BLIND SNR & SIGMA ESTIMATION ---
+        noise_floor_est = median(abs(RDM_pure(:))) / 0.6745; 
+        peak_signal_val = max(RDM_pure(:));
+        est_linear_snr = max(1, (peak_signal_val / noise_floor_est)^2);
+        
+        sigma = max(1e-5, 0.01 / sqrt(est_linear_snr));
         K = 5;
         
         for target_idx = 1:num_targets
@@ -239,32 +225,17 @@ for snr_idx = 1:length(snr_vec)
             t_abs = t_total(1:end-1);
             a_t = S * mod(t_abs, Tc);  
             
-            % 1. Fine Range IFF Optimization
-            range_grid = linspace(rough_center - 0.5, rough_center + 0.5, 200); 
-            LIFF_fine = zeros(size(range_grid));
+            % Fine Range Optimization using fminbnd (Sub-millimeter precision)
+            options = optimset('TolX', 1e-8, 'Display', 'off');
             fd_fixed = 2 * rough_v_center / lambda; 
             
-            for ir = 1:length(range_grid)
-                R_trial = range_grid(ir);
-                tau_trial = 2 * R_trial / c;
+            obj_r = @(R) -iff_likelihood(zeta_local, ...
+                mod((a_t - (S * mod(t_abs - (2*R/c), Tc)) + fd_fixed)/Fs + 0.5, 1) - 0.5, ...
+                sigma, K);
                 
-                t_delayed_abs = t_abs - tau_trial;
-                a_rx = S * mod(t_delayed_abs, Tc);
-                valid_mask = t_abs >= tau_trial;
-                a_rx(~valid_mask) = 0;
-                
-                g_model = a_t - a_rx + fd_fixed;
-                g_norm = mod(g_model/Fs + 0.5, 1) - 0.5;
-                
-                LIFF_fine(ir) = iff_likelihood(zeta_local, g_norm, sigma, K);
-            end
-            
-            [~, fine_idx] = max(LIFF_fine);
-            detected_ranges(target_idx) = range_grid(fine_idx);
-            
+            best_r_refined = fminbnd(obj_r, rough_center - 0.2, rough_center + 0.2, options);
+            detected_ranges(target_idx) = best_r_refined;
            
-            velocity_grid = linspace(rough_v_center - 1, rough_v_center + 1, 100);
-            LIFF_v_fine = zeros(size(velocity_grid));
             
             tau_locked = 2 * detected_ranges(target_idx) / c;
             t_delayed_abs_locked = t_abs - tau_locked;
@@ -272,18 +243,12 @@ for snr_idx = 1:length(snr_vec)
             valid_mask_locked = t_abs >= tau_locked;
             a_rx_locked(~valid_mask_locked) = 0;
             
-            for iv = 1:length(velocity_grid)
-                v_trial = velocity_grid(iv);
-                fd_trial = 2 * v_trial / lambda; 
+            obj_v = @(v) -iff_likelihood(zeta_local, ...
+                mod((a_t - a_rx_locked + (2*v/lambda))/Fs + 0.5, 1) - 0.5, ...
+                sigma, K);
                 
-                g_model_v = a_t - a_rx_locked + fd_trial; 
-                g_norm_v = mod(g_model_v/Fs + 0.5, 1) - 0.5;
-                
-                LIFF_v_fine(iv) = iff_likelihood(zeta_local, g_norm_v, sigma, K);
-            end
-            
-            [~, fine_v_idx] = max(LIFF_v_fine);
-            detected_vels(target_idx) = velocity_grid(fine_v_idx);
+            best_v_refined = fminbnd(obj_v, rough_v_center - 0.2, rough_v_center + 0.2, options);
+            detected_vels(target_idx) = best_v_refined;
         end
         
         time_iff_mc(mc) = toc(t2);
@@ -310,33 +275,30 @@ for snr_idx = 1:length(snr_vec)
         err_fft_v_mc(mc) = mean(err_fft_v_target);
         err_iff_v_mc(mc) = mean(err_iff_v_target);
         
-        
         local_err_fft_r{mc} = abs(pure_fft_detected_ranges - target_Rs);
         local_err_iff_r{mc} = abs(detected_ranges - target_Rs);
     end
-    
     
     rmse_pure_fft_range_agg(snr_idx) = sqrt(mean(err_fft_r_mc));
     rmse_iff_range_agg(snr_idx)      = sqrt(mean(err_iff_r_mc));
     rmse_pure_fft_vel_agg(snr_idx)   = sqrt(mean(err_fft_v_mc));
     rmse_iff_vel_agg(snr_idx)        = sqrt(mean(err_iff_v_mc));
     
-    
     snr_err_fft_r = horzcat(local_err_fft_r{:});
     snr_err_iff_r = horzcat(local_err_iff_r{:});
-    global_err_fft_r = [global_err_fft_r, snr_err_fft_r];
-    global_err_iff_r = [global_err_iff_r, snr_err_iff_r];
+    
+    % Isolate errors strictly for SNR = 10 dB
+    if current_snr == 10
+        cdf_err_fft_r_10db = snr_err_fft_r;
+        cdf_err_iff_r_10db = snr_err_iff_r;
+    end
     
     total_time_fft = total_time_fft + sum(time_fft_mc);
     total_time_iff = total_time_iff + sum(time_iff_mc);
 end
-
 elapsed_time = toc;
-
-%% 6. PLOT 
+%% 6. RMSE PLOT 
 figure('Color', 'black', 'Position', [100, 100, 1300, 550]);
-
-
 subplot(1,2,1);
 plot(snr_vec, rmse_pure_fft_range_agg, '-o', 'LineWidth', 2, 'MarkerFaceColor', 'auto'); hold on;
 plot(snr_vec, rmse_iff_range_agg, '-s', 'LineWidth', 2, 'MarkerFaceColor', 'auto');
@@ -345,8 +307,6 @@ xlabel('SNR (dB)', 'Color', 'white'); ylabel('Aggregate Range RMSE (m) [Log Scal
 title('Aggregate Range RMSE (5 Targets)', 'Color', 'white');
 legend('Pure Normal FFT', 'Proposed IFF Method', 'Location', 'northeast');
 set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w');
-
-
 subplot(1,2,2);
 plot(snr_vec, rmse_pure_fft_vel_agg, '-o', 'LineWidth', 2, 'MarkerFaceColor', 'auto'); hold on;
 plot(snr_vec, rmse_iff_vel_agg, '-s', 'LineWidth', 2, 'MarkerFaceColor', 'auto');
@@ -355,10 +315,22 @@ xlabel('SNR (dB)', 'Color', 'white'); ylabel('Aggregate Velocity RMSE (m/s) [Log
 title('Aggregate Velocity RMSE (5 Targets)', 'Color', 'white');
 legend('Pure Normal FFT', 'Proposed IFF Method', 'Location', 'northeast');
 set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w');
-
 set(gcf, 'InvertHardcopy', 'off');
-
-
+%% 7. CDF PLOT AT FIXED SNR = 10 dB
+figure('Color', 'black', 'Position', [150, 150, 800, 500]);
+[x_fft, ~] = sort(cdf_err_fft_r_10db(:));
+cdf_fft = (1:length(x_fft))' / length(x_fft);
+[x_iff, ~] = sort(cdf_err_iff_r_10db(:));
+cdf_iff = (1:length(x_iff))' / length(x_iff);
+plot(x_fft, cdf_fft, 'm--', 'LineWidth', 2); hold on;
+plot(x_iff, cdf_iff, 'c-', 'LineWidth', 2);
+grid on;
+xlabel('Absolute Range Error (m)', 'Color', 'white');
+ylabel('Cumulative Probability (CDF)', 'Color', 'white');
+title('CDF of Range Errors at SNR = 10 dB (Pure FFT vs. Proposed IFF)', 'Color', 'white');
+legend('Pure Normal FFT', 'Proposed IFF Method', 'Location', 'southeast');
+set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w');
+set(gcf, 'InvertHardcopy', 'off');
 %% 8. IFF LIKELIHOOD FUNCTION
 function L = iff_likelihood(zeta, g_norm, sigma, K)
     Fs = 60e6;
